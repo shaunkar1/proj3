@@ -42,7 +42,7 @@ def main():
             vals=[v.isoformat() if hasattr(v,"isoformat") else v for v in row]
             encoded.append(json.dumps(vals,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
         h = hashlib.sha256()
-        for item in sorted(encoded): h.update(item+b"\\n")
+        for item in sorted(encoded): h.update(item+bytes([10]))
         observed = (len(rows),h.hexdigest())
         expected = REFERENCE[table]
         passed=observed==expected
