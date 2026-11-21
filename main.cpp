@@ -151,9 +151,9 @@ struct IdGraph{
   if(sz[x]<sz[y])swap(x,y);parent[y]=x;sz[x]+=sz[y];if(names[y]<names[x])names[x]=names[y];
  }
 };
-struct EventRecord{int64_t ingest=0,ts=0;uint32_t user=0;int32_t price=0;uint16_t cat=0;bool purchase=false,valid=false;};
+struct EventRecord{int64_t ingest=0,ts=0;uint32_t user=0;int32_t price=0;uint16_t cat=0;bool purchase=false,valid=false,assigned=false;};
 struct DenseEvents {
- struct Entry {string_view id{};EventRecord rec{};bool assigned=false;};
+ struct Entry {string_view id{};EventRecord rec{};};
  struct Slot {uint32_t hash=0;uint32_t index=0;};
  vector<Slot> slots;
  vector<Entry> entries;
@@ -268,7 +268,7 @@ static void run(const fs::path& data,const fs::path& scratch){
     auto &v=pending[ix];if(v.empty())continue;
     lock_guard<mutex> guard(shardLocks[ix]);
     for(auto &item:v){auto e=shards[ix].slot(item.id,item.h);
-     if(!e->assigned||e->rec.ingest>item.rec.ingest){e->rec=item.rec;e->assigned=true;}}
+     if(!e->rec.assigned||e->rec.ingest>item.rec.ingest){e->rec=item.rec;e->rec.assigned=true;}}
     v.clear();
    }
    buffered=0;
