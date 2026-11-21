@@ -177,16 +177,26 @@ struct DenseEvents {
  void clear(){vector<Slot>().swap(slots);vector<Entry>().swap(entries);}
 };
 struct DenseSet {
- struct Entry {string_view id{};uint64_t hash=0;};
+ struct Entry {const char* ptr=nullptr;uint32_t len=0,hash=0;};
  vector<Entry> slots;size_t count=0;
  void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);}
  bool insert(string_view id){
-  uint64_t h=DenseEvents::hkey(id);size_t mask=slots.size()-1,j=h&mask;
-  while(slots[j].hash){auto &e=slots[j];if(e.hash==h&&e.id==id)return false;j=(j+1)&mask;}
-  if((count+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);count=0;for(const auto&e:old)if(e.hash)place(e.id,e.hash);mask=slots.size()-1;j=h&mask;while(slots[j].hash)j=(j+1)&mask;}
-  slots[j]={id,h};++count;return true;
+  uint32_t h=(uint32_t)DenseEvents::hkey(id)|1u;
+  size_t mask=slots.size()-1,j=h&mask;
+  while(slots[j].hash){auto &e=slots[j];
+   if(e.hash==h&&e.len==id.size()&&memcmp(e.ptr,id.data(),id.size())==0)return false;
+   j=(j+1)&mask;
+  }
+  if((count+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);count=0;
+   for(const auto&e:old)if(e.hash)place(string_view(e.ptr,e.len),e.hash);
+   mask=slots.size()-1;j=h&mask;while(slots[j].hash)j=(j+1)&mask;
+  }
+  slots[j]={id.data(),(uint32_t)id.size(),h};++count;return true;
  }
- void place(string_view id,uint64_t h){size_t mask=slots.size()-1,j=h&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]={id,h};++count;}
+ void place(string_view id,uint32_t h){size_t mask=slots.size()-1,j=h&mask;
+   while(slots[j].hash)j=(j+1)&mask;
+   slots[j]={id.data(),(uint32_t)id.size(),h};++count;
+ }
  void clear(){vector<Entry> t;t.swap(slots);count=0;}
 };
 struct Event{int64_t ts;uint32_t user;int32_t price;uint16_t cat;bool purchase;};
