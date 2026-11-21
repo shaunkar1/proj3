@@ -190,7 +190,7 @@ struct DenseSet {
  void clear(){vector<Entry> t;t.swap(slots);count=0;}
 };
 struct Event{int64_t ts;uint32_t user;int32_t price;uint16_t cat;bool purchase;};
-struct Click{int64_t ts;uint32_t user;uint16_t campaign;string id;};
+struct Click{int64_t ts;uint32_t user;uint16_t campaign;string_view id;};
 struct Camp{string id,channel;};
 struct Totals{uint64_t sessions=0,purchasing_sessions=0,revenue=0,assists=0;};
 struct UserTotals{uint64_t sessions=0,events=0,revenue=0;};
@@ -250,16 +250,16 @@ __mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first pars
  vector<Click> clicks;DenseSet seen;
  const auto clickFiles=csv_files(data/"clicks");
  uint64_t clickBytes=0;for(const auto& p:clickFiles)clickBytes+=fs::file_size(p);
- seen.reserve((size_t)(clickBytes/55+1));
+ seen.reserve((size_t)(clickBytes/36+1));
  for(const auto& p:clickFiles)read_lines(p,[&](string_view line){
   string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
   auto key=f[0];if(!seen.insert(key))return;
   int64_t ts=0;auto ci=camps.find(f[2]);
   if(f[1].empty()||ci==camps.end()||!parse_ts(f[3],ts)||ts<window_start-WEEK||ts>=window_end)return;
-  clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,string(key)});
+  clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,key});
  },true);
  cerr<<"surviving clicks: "<<clicks.size()<<"\n";
- seen.clear();release_mmaps();
+ seen.clear(); // Preserve click ID mmap until after sorting tie-breaks.
  {decltype(products) empty;products.swap(empty);} {decltype(categories) empty;categories.swap(empty);}
  {decltype(graph.keys) empty;graph.keys.swap(empty);}
 __mark("CLICK_READ"); // graph must stay alive for canonical names; no new users are interned after this point.
@@ -268,6 +268,7 @@ __mark("CLICK_READ"); // graph must stay alive for canonical names; no new users
   if(a.user!=b.user)return a.user<b.user;if(a.ts!=b.ts)return a.ts<b.ts;
   return a.id>b.id; // last click at equal timestamp has lexicographically smallest ID
  });
+ release_mmaps();
 __mark("SORT"); fs::create_directories(scratch);
  ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc);
  ofstream cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);
