@@ -39,9 +39,12 @@ static int64_t days_from_civil(int y,unsigned m,unsigned d){
  return (int64_t)era*146097+(int)yoe_days-719468;
 }
 static bool parse_ts(string_view s,int64_t& out){
- if(ascii_digits(s)){
+ if(s.size() && s.size()<=18){
+   uint64_t x=0;bool digits=true;
+   for(unsigned char c:s){if(c<'0'||c>'9'){digits=false;break;}x=x*10+(c-'0');}
+   if(digits){out=(int64_t)x;return true;}
+ }else if(ascii_digits(s)){
    uint64_t x=0;
-   if(s.size()<=18){for(unsigned char c:s) x=x*10+(c-'0');out=(int64_t)x;return true;}
    for(unsigned char c:s){unsigned k=c-'0';if(x>(uint64_t(INT64_MAX)-k)/10)return false;x=x*10+k;}
    out=(int64_t)x;return true;
  }
@@ -61,7 +64,7 @@ static bool parse_ts(string_view s,int64_t& out){
 }
 // The challenge's CSV dialect has no embedded separators or quotes, even in quoted fields.
 // We explicitly preserve CR as data and never trim whitespace.
-static bool fields(string_view line,int n,string_view* out){
+static bool fields_slow(string_view line,int n,string_view* out){
  if(line.empty())return false;
  const char *p=line.data(),*end=p+line.size();
  for(int j=0;j<n;j++){
@@ -76,6 +79,19 @@ static bool fields(string_view line,int n,string_view* out){
    out[j]=f;p=q+1;
  }
  return p==end+1;
+}
+static bool fields(string_view line,int n,string_view* out){
+ if(line.empty())return false;
+ const char *p=line.data(),*end=p+line.size();
+ if(memchr(p,'"',end-p))return fields_slow(line,n,out);
+ for(int j=0;j<n-1;j++){
+   const char *q=(const char*)memchr(p,',',end-p);
+   if(!q)return false;
+   out[j]=string_view(p,q-p);p=q+1;
+ }
+ if(memchr(p,',',end-p))return false;
+ out[n-1]=string_view(p,end-p);
+ return true;
 }
 static vector<fs::path> csv_files(const fs::path& dir){
  vector<fs::path> out;
