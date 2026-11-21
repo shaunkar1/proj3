@@ -222,6 +222,10 @@ static void run(const fs::path& data,const fs::path& scratch){
  vector<Camp> campaigns;FastMap<uint16_t> camps;
  read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");camps.emplace(string(f[0]),(uint16_t)campaigns.size());campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ // Frozen link roots let workers resolve already-linked user IDs without the global graph lock.
+ unordered_map<string_view,uint32_t,TransparentHash,equal_to<>> linkedRoots;
+ linkedRoots.reserve(graph.keys.size());
+ for(auto const& item: graph.keys)linkedRoots.emplace(string_view(item.first),graph.find(item.second));
  // Earliest parseable duplicate, including one that later fails validation.
  static constexpr size_t SHARDS=32;
 #ifndef SHOP_BATCH
@@ -294,8 +298,10 @@ static void run(const fs::path& data,const fs::path& scratch){
         auto u=userCache.find(f[1]);
         if(u!=userCache.end())rec.user=u->second;
         else{
-         lock_guard<mutex> guard(graphLock);
-         rec.user=graph.intern(f[1]);userCache.emplace(f[1],rec.user);
+         auto lk=linkedRoots.find(f[1]);
+         if(lk!=linkedRoots.end())rec.user=lk->second;
+         else {lock_guard<mutex> guard(graphLock);rec.user=graph.intern(f[1]);}
+         userCache.emplace(f[1],rec.user);
         }
         if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
       }
