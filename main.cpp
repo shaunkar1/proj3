@@ -326,19 +326,61 @@ static void run(const fs::path& data,const fs::path& scratch){
  for(auto& sh:shards)sh.clear();release_mmaps();
  __mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
  vector<Click> clicks;
+ // The identity graph is complete for all users with surviving events.
+ // A click for a person with no surviving event can affect neither output.
+ vector<uint8_t> hasEvents(graph.parent.size(),0);
+ for(const auto& ev:events)hasEvents[ev.user]=1;
+ unordered_map<string_view,uint32_t,TransparentHash,equal_to<>> clickUserRoots;
+ clickUserRoots.reserve(graph.keys.size());
+ for(const auto& [id,index]:graph.keys)clickUserRoots.emplace(string_view(id),graph.find(index));
  const auto clickFiles=csv_files(data/"clicks");
  uint64_t clickBytes=0;for(const auto& p:clickFiles)clickBytes+=fs::file_size(p);
- clicks.reserve((size_t)(clickBytes/48+1));
- for(const auto& p:clickFiles)read_lines(p,[&](string_view line){
-  string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
-  auto key=f[0];
-  int64_t ts=0;auto ci=camps.find(f[2]);
-  if(f[1].empty()||ci==camps.end()||!parse_ts(f[3],ts)||ts<window_start-WEEK||ts>=window_end)return;
-  clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,key});
- },true);
- cerr<<"surviving clicks: "<<clicks.size()<<"\n";
- // Duplicate clicks have identical values, so retaining them does not change attribution or distinct-campaign assists.
+ vector<Range> clickTasks;
+ for(const auto& path:clickFiles){
+  int fd=open(path.c_str(),O_RDONLY);if(fd<0)throw runtime_error("Cannot open "+path.string());
+  struct stat st{};if(fstat(fd,&st)!=0){close(fd);throw runtime_error("Cannot stat click file");}
+  size_t len=st.st_size;if(!len){close(fd);continue;}
+  void* raw=mmap(nullptr,len,PROT_READ,MAP_PRIVATE,fd,0);close(fd);
+  if(raw==MAP_FAILED)throw runtime_error("Click mmap failed");
+  held_mmaps.push_back({raw,len});
+  const char* base=(const char*)raw;
+  const char* nl=(const char*)memchr(base,'\n',len);if(!nl)continue;
+  size_t header=nl+1-base,left=len-header;
+  size_t n=min((size_t)8,(left/200000+1));
+  for(size_t i=0;i<n;++i)clickTasks.push_back({base,len,header+(left*i)/n,header+(left*(i+1))/n});
+ }
+ atomic<size_t> nextClick(0);
+ vector<vector<Click>> localClicks(nw);
+ auto clickWorker=[&](unsigned wi){
+  auto& result=localClicks[wi];
+  for(;;){size_t ti=nextClick.fetch_add(1,memory_order_relaxed);if(ti>=clickTasks.size())break;
+   auto [base,len,start,stop]=clickTasks[ti];
+   const char *limit=base+len,*p=base+start;
+   if(start && base[start-1]!='\n'){
+    auto nl=(const char*)memchr(p,'\n',limit-p);
+    if(!nl)continue;p=nl+1;
+   }
+   while(p<limit&&(size_t)(p-base)<stop){
+    auto nl=(const char*)memchr(p,'\n',limit-p);
+    auto q=nl?nl:limit;
+    string_view line(p,q-p);p=nl?nl+1:limit;
+    string_view f[4];if(!fields(line,4,f)||f[0].empty()||f[1].empty())continue;
+    auto it=clickUserRoots.find(f[1]);if(it==clickUserRoots.end()||!hasEvents[it->second])continue;
+    auto ci=camps.find(f[2]);if(ci==camps.end())continue;
+    int64_t ts=0;if(!parse_ts(f[3],ts)||ts<window_start-WEEK||ts>=window_end)continue;
+    result.push_back({ts,it->second,ci->second,f[0]});
+   }
+  }
+ };
+ vector<thread> clickWorkers;clickWorkers.reserve(nw);
+ for(unsigned i=0;i<nw;++i)clickWorkers.emplace_back(clickWorker,i);
+ for(auto& t:clickWorkers)t.join();
+ size_t clickCount=0;for(auto& v:localClicks)clickCount+=v.size();
+ clicks.reserve(clickCount);
+ for(auto& v:localClicks)clicks.insert(clicks.end(),v.begin(),v.end());
+ cerr<<"surviving clicks with event-bearing person: "<<clicks.size()<<"\n";
  {decltype(products) empty;products.swap(empty);} {decltype(categories) empty;categories.swap(empty);}
+ clickUserRoots.clear();
  {decltype(graph.keys) empty;graph.keys.swap(empty);}
 __mark("CLICK_READ"); // graph must stay alive for canonical names; no new users are interned after this point.
  __gnu_parallel::sort(events.begin(),events.end(),[](const Event& a,const Event& b){if(a.user!=b.user)return a.user<b.user;return a.ts<b.ts;});
