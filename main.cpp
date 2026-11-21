@@ -224,6 +224,9 @@ static void run(const fs::path& data,const fs::path& scratch){
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  // Earliest parseable duplicate, including one that later fails validation.
  static constexpr size_t SHARDS=32;
+#ifndef SHOP_BATCH
+#define SHOP_BATCH 512
+#endif
  array<DenseEvents,SHARDS> shards;
  array<mutex,SHARDS> shardLocks;
  mutex graphLock;
@@ -251,6 +254,21 @@ static void run(const fs::path& data,const fs::path& scratch){
  auto worker=[&](unsigned){
   unordered_map<string_view,uint32_t,TransparentHash,equal_to<>> userCache;
   userCache.reserve(1<<16);
+  struct Pending {string_view id;uint64_t h;EventRecord rec;};
+  array<vector<Pending>,SHARDS> pending;
+  for(auto &v:pending)v.reserve(32);
+  unsigned batchLimit=512; if(const char *e=getenv("SHOP_BATCH")){int v=atoi(e);if(v>=32&&v<=8192)batchLimit=v;}
+  size_t buffered=0;
+  auto flush=[&](){
+   for(unsigned ix=0;ix<SHARDS;ix++){
+    auto &v=pending[ix];if(v.empty())continue;
+    lock_guard<mutex> guard(shardLocks[ix]);
+    for(auto &item:v){auto e=shards[ix].slot(item.id,item.h);
+     if(!e->assigned||e->rec.ingest>item.rec.ingest){e->rec=item.rec;e->assigned=true;}}
+    v.clear();
+   }
+   buffered=0;
+  };
   for(;;){size_t ti=next.fetch_add(1,memory_order_relaxed);if(ti>=tasks.size())break;
    auto [base,len,start,stop]=tasks[ti];
    const char* limit=base+len;
@@ -283,12 +301,11 @@ static void run(const fs::path& data,const fs::path& scratch){
       }
     }
     uint64_t h=DenseEvents::hkey(f[0]);unsigned shard=(unsigned)(h>>59);
-    {lock_guard<mutex> guard(shardLocks[shard]);
-     auto e=shards[shard].slot(f[0],h);
-     if(!e->assigned||e->rec.ingest>ingest){e->rec=rec;e->assigned=true;}
-    }
+    pending[shard].push_back({f[0],h,rec});
+    if(++buffered==batchLimit)flush();
    }
   }
+  if(buffered)flush();
  };
  vector<thread> workers;workers.reserve(nw);
  for(unsigned i=0;i<nw;++i)workers.emplace_back(worker,i);
@@ -302,19 +319,19 @@ static void run(const fs::path& data,const fs::path& scratch){
  cerr<<"deduplicated events: "<<unique<<", surviving: "<<events.size()<<"\n";
  for(auto& sh:shards)sh.clear();release_mmaps();
  __mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
- vector<Click> clicks;DenseSet seen;
+ vector<Click> clicks;
  const auto clickFiles=csv_files(data/"clicks");
  uint64_t clickBytes=0;for(const auto& p:clickFiles)clickBytes+=fs::file_size(p);
- seen.reserve((size_t)(clickBytes/36+1));
+ clicks.reserve((size_t)(clickBytes/48+1));
  for(const auto& p:clickFiles)read_lines(p,[&](string_view line){
   string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
-  auto key=f[0];if(!seen.insert(key))return;
+  auto key=f[0];
   int64_t ts=0;auto ci=camps.find(f[2]);
   if(f[1].empty()||ci==camps.end()||!parse_ts(f[3],ts)||ts<window_start-WEEK||ts>=window_end)return;
   clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,key});
  },true);
  cerr<<"surviving clicks: "<<clicks.size()<<"\n";
- seen.clear(); // Preserve click ID mmap until after sorting tie-breaks.
+ // Duplicate clicks have identical values, so retaining them does not change attribution or distinct-campaign assists.
  {decltype(products) empty;products.swap(empty);} {decltype(categories) empty;categories.swap(empty);}
  {decltype(graph.keys) empty;graph.keys.swap(empty);}
 __mark("CLICK_READ"); // graph must stay alive for canonical names; no new users are interned after this point.
