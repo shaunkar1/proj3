@@ -23,6 +23,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <memory>
 #include <unistd.h>
 using namespace std;
 namespace fs=std::filesystem;
@@ -165,7 +169,7 @@ struct DenseEvents {
  Entry* slot(string_view id,uint64_t h){
   h |= 1ULL; // exact same home bucket before/after rehash; 0 denotes empty
   if((entries.size()+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);
-   size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=e.hash&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
+   size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=hkey(entries[e.index].id)&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
   size_t mask=slots.size()-1,j=h&mask;
   for(;;){auto& e=slots[j];
    if(!e.hash){e.hash=(uint32_t)h|1u;e.index=entries.size();entries.emplace_back();entries.back().id=id;return &entries.back();}
@@ -219,34 +223,85 @@ static void run(const fs::path& data,const fs::path& scratch){
  read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");camps.emplace(string(f[0]),(uint16_t)campaigns.size());campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  // Earliest parseable duplicate, including one that later fails validation.
- DenseEvents eventmap;
+ static constexpr size_t SHARDS=32;
+ array<DenseEvents,SHARDS> shards;
+ array<mutex,SHARDS> shardLocks;
+ mutex graphLock;
  const auto eventFiles=csv_files(data/"events");
  uint64_t eventBytes=0;for(const auto& p:eventFiles)eventBytes+=fs::file_size(p);
- eventmap.reserve((size_t)(eventBytes/65+1));
- for(const auto& p:eventFiles)read_lines(p,[&](string_view line){
-  string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
-  auto key=f[0];auto h=DenseEvents::hkey(key);
-
-  int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
-  auto it=eventmap.slot(key,h);
-  if(it->assigned && it->rec.ingest<=ingest)return;
-  EventRecord rec;rec.ingest=ingest;
-  int64_t ts;
-  if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
-    (f[4]=="view"||f[4]=="cart"||f[4]=="purchase")){
-    int32_t price=0;bool purchase=f[4]=="purchase";
-    if(!purchase||price_value(f[6],price)){
-      rec.valid=true;rec.ts=ts;rec.user=graph.intern(f[1]);rec.price=price;rec.purchase=purchase;
-      if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
+ for(auto &sh:shards)sh.reserve(eventBytes/(65*SHARDS)+16);
+ struct Range {const char* base;size_t len,start,stop;};
+ vector<Range> tasks;
+ for(const auto& p:eventFiles){
+  int fd=open(p.c_str(),O_RDONLY);if(fd<0)throw runtime_error("open failed "+p.string());
+  struct stat st{};if(fstat(fd,&st)!=0){close(fd);throw runtime_error("stat failed");}
+  size_t len=st.st_size;if(!len){close(fd);continue;}
+  void* raw=mmap(nullptr,len,PROT_READ,MAP_PRIVATE,fd,0);close(fd);
+  if(raw==MAP_FAILED)throw runtime_error("mmap failed");
+  held_mmaps.push_back({raw,len});
+  auto base=(const char*)raw;
+  auto nl=(const char*)memchr(base,'\n',len);if(!nl)continue;
+  size_t header=nl+1-base;
+  size_t left=len-header;
+  size_t n=std::min((size_t)8,(left/250000+1));
+  for(size_t i=0;i<n;++i)tasks.push_back({base,len,header+(left*i)/n,header+(left*(i+1))/n});
+ }
+ atomic<size_t> next(0);
+ unsigned nw=4; if(const char* env=getenv("NCPU")){int value=atoi(env);if(value>0)nw=std::min(nw,(unsigned)std::clamp(value,1,8));} if(const char* env=getenv("SHOP_WORKERS")){int value=atoi(env);if(value>0)nw=std::min(nw,(unsigned)std::clamp(value,1,8));}
+ auto worker=[&](unsigned){
+  unordered_map<string_view,uint32_t,TransparentHash,equal_to<>> userCache;
+  userCache.reserve(1<<16);
+  for(;;){size_t ti=next.fetch_add(1,memory_order_relaxed);if(ti>=tasks.size())break;
+   auto [base,len,start,stop]=tasks[ti];
+   const char* limit=base+len;
+   const char* p=base+start;
+   if(start && base[start-1]!='\n'){
+    const char* nl=(const char*)memchr(p,'\n',limit-p);
+    if(!nl)continue;
+    p=nl+1;
+   }
+   while(p<limit && (size_t)(p-base)<stop){
+    auto nl=(const char*)memchr(p,'\n',limit-p);
+    const char* q=nl?nl:limit;
+    string_view line(p,q-p);p=nl?nl+1:limit;
+    string_view f[7];if(!fields(line,7,f)||f[0].empty())continue;
+    int64_t ingest=0;if(!parse_ts(f[3],ingest))continue;
+    EventRecord rec;rec.ingest=ingest;
+    int64_t ts;
+    if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
+      (f[4]=="view"||f[4]=="cart"||f[4]=="purchase")){
+      int32_t price=0;bool purchase=f[4]=="purchase";
+      if(!purchase||price_value(f[6],price)){
+        rec.valid=true;rec.ts=ts;rec.price=price;rec.purchase=purchase;
+        auto u=userCache.find(f[1]);
+        if(u!=userCache.end())rec.user=u->second;
+        else{
+         lock_guard<mutex> guard(graphLock);
+         rec.user=graph.intern(f[1]);userCache.emplace(f[1],rec.user);
+        }
+        if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
+      }
     }
+    uint64_t h=DenseEvents::hkey(f[0]);unsigned shard=(unsigned)(h>>59);
+    {lock_guard<mutex> guard(shardLocks[shard]);
+     auto e=shards[shard].slot(f[0],h);
+     if(!e->assigned||e->rec.ingest>ingest){e->rec=rec;e->assigned=true;}
+    }
+   }
   }
-  it->rec=rec;it->assigned=true;
- },true);
-__mark("EVENT_READ"); vector<Event> events;events.reserve(eventmap.size());
- for(const auto& entry:eventmap.entries){const auto& e=entry.rec;if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});}
- cerr<<"deduplicated events: "<<eventmap.size()<<", surviving: "<<events.size()<<"\n";
- eventmap.clear();release_mmaps();
-__mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
+ };
+ vector<thread> workers;workers.reserve(nw);
+ for(unsigned i=0;i<nw;++i)workers.emplace_back(worker,i);
+ for(auto& t:workers)t.join();
+ __mark("EVENT_READ");
+ vector<Event> events;size_t unique=0;
+ for(auto& sh:shards)unique+=sh.size();events.reserve(unique);
+ for(auto& sh:shards)for(auto const& entry:sh.entries){auto const& e=entry.rec;
+  if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});
+ }
+ cerr<<"deduplicated events: "<<unique<<", surviving: "<<events.size()<<"\n";
+ for(auto& sh:shards)sh.clear();release_mmaps();
+ __mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
  vector<Click> clicks;DenseSet seen;
  const auto clickFiles=csv_files(data/"clicks");
  uint64_t clickBytes=0;for(const auto& p:clickFiles)clickBytes+=fs::file_size(p);
