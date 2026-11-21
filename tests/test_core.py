@@ -50,7 +50,7 @@ class Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not BIN.exists():
-            subprocess.run(['g++','-std=c++20','-O2','-fopenmp','-o',str(BIN),str(ROOT/'main.cpp')],check=True)
+            subprocess.run(['g++','-std=c++20','-O2','-o',str(BIN),str(ROOT/'main.cpp')],check=True)
 
     def test_sessions_attribution_assists_and_bad_duplicates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +136,18 @@ class Tests(unittest.TestCase):
             self.assertEqual(u[('solo',day)],(1,1,0,None))
             self.assertEqual(c[('organic',day)],('organic',3,2,250,0))
             self.assertEqual(len(c),1)
+
+    def test_dense_hash_rehash_and_zero_ingest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);d=root/'data';s=root/'scratch'
+            records=[(str(i),'u','1000','1000','view','p1','') for i in range(20000)]
+            # Earlier record for duplicate ID, including zero-ingest sentinel.
+            records.append(('0','u','1000','1001','view','p1',''))
+            create(d,start='1970-01-01T00:00:00Z',end='1970-01-03T00:00:00Z',
+                   links=[],events=records,clicks=[])
+            u,c=run_core(d,s)
+            self.assertEqual(u,{('u',0):(1,20000,0,None)})
+            self.assertEqual(c[('organic',0)][1:],(1,0,0,0))
 
     def test_equal_timestamp_click_tie_and_7d_window(self):
         with tempfile.TemporaryDirectory() as tmp:
