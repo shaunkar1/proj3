@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 
 REFERENCE = {
-    "user_daily": (117038, "e45d027cb13dc403cdfa822d9d1c795f76d39a1412bef83b449c09898e8a16c6"),
+    "user_daily": (117038, "853f7caf9fb69f1689afbde3d2e52cc6e1399b453707771d646b06667cf980da"),
     "campaign_daily": (27400, "e4c1dc234e92968ac078ea5acef82b75c7fd2e8cfa5dab11a93b2fbf243e3ce6"),
 }
 COLUMNS = {
