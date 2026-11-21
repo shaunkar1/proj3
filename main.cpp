@@ -169,7 +169,7 @@ struct DenseEvents {
  Entry* slot(string_view id,uint64_t h){
   h |= 1ULL; // exact same home bucket before/after rehash; 0 denotes empty
   if((entries.size()+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);
-   size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=hkey(entries[e.index].id)&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
+   size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=(hkey(entries[e.index].id)|1ULL)&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
   size_t mask=slots.size()-1,j=h&mask;
   for(;;){auto& e=slots[j];
    if(!e.hash){e.hash=(uint32_t)h|1u;e.index=entries.size();entries.emplace_back();entries.back().id=id;return &entries.back();}
