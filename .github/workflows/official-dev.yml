@@ -10,6 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Build organizer's generator
         run: cargo build --manifest-path tools/official-generator/Cargo.toml --release --locked
       - name: Generate deterministic official dev inputs
@@ -19,7 +22,7 @@ jobs:
       - name: Compile engine and install DuckDB
         run: |
           g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -o shopping-core main.cpp
-          python3 -m pip install duckdb==1.4.1
+          python3 -m pip install --only-binary=:all: duckdb==1.4.1
       - name: Run complete CSV-to-Parquet pipeline
         env:
           DATA_DIR: /tmp/shop-dev
