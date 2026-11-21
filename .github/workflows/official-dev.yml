@@ -15,6 +15,12 @@ jobs:
           python-version: '3.11'
       - name: Build organizer's generator
         run: cargo build --manifest-path tools/official-generator/Cargo.toml --release --locked
+      - name: Export compiled official generator for benchmarking
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-generator-amd64
+          path: tools/official-generator/target/release/generate
+          retention-days: 1
       - name: Generate deterministic official dev inputs
         run: |
           mkdir -p /tmp/shop-dev /tmp/shop-scratch /tmp/shop-out
