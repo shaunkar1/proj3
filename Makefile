@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto
+CXXFLAGS ?= -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp
 
 .PHONY: all test docker-build run clean
 all: shopping-core
