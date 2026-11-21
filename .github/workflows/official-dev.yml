@@ -34,6 +34,13 @@ jobs:
           /usr/bin/time -v python3 write_parquet.py
           python3 scripts/check_official_dev.py
 
+      - name: Compare actual rows with public reference on failure
+        if: failure()
+        run: |
+          curl -fsSL --retry 2 --max-time 60 https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip -o /tmp/shop-dev-answer.zip
+          mkdir -p /tmp/shop-answer
+          unzip -oq /tmp/shop-dev-answer.zip -d /tmp/shop-answer
+          python3 scripts/diff_official_dev.py /tmp/shop-scratch /tmp/shop-answer
       - name: Save 1M dev output for diagnostic comparison
         if: always()
         uses: actions/upload-artifact@v4
