@@ -158,7 +158,7 @@ struct DenseEvents {
  static uint64_t hkey(string_view s){
    const unsigned char* p=(const unsigned char*)s.data();size_t n=s.size();
    uint64_t h=0x9e3779b97f4a7c15ULL ^ (n*0xbf58476d1ce4e5b9ULL);
-   while(n>=8){uint64_t w;memcpy(&w,p,8);h=mix(h^w);p+=8;n-=8;}
+   while(n>=8){uint64_t w;memcpy(&w,p,8);h=(h^w)*0xa0761d6478bd642fULL;p+=8;n-=8;}
    uint64_t tail=0;memcpy(&tail,p,n);h=mix(h^tail);
    return h?h:1;
  }
@@ -225,8 +225,10 @@ static void run(const fs::path& data,const fs::path& scratch){
  eventmap.reserve((size_t)(eventBytes/65+1));
  for(const auto& p:eventFiles)read_lines(p,[&](string_view line){
   string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
+  auto key=f[0];auto h=DenseEvents::hkey(key);
+  __builtin_prefetch(&eventmap.slots[h&(eventmap.slots.size()-1)],1,1);
   int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
-  auto key=f[0];auto h=DenseEvents::hkey(key);auto it=eventmap.slot(key,h);
+  auto it=eventmap.slot(key,h);
   if(it->assigned && it->rec.ingest<=ingest)return;
   EventRecord rec;rec.ingest=ingest;
   int64_t ts;
