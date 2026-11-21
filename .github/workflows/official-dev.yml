@@ -1,0 +1,32 @@
+name: Official Shopping Sessions 1M dev check
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  verify-dev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build organizer's generator
+        run: cargo build --manifest-path tools/official-generator/Cargo.toml --release --locked
+      - name: Generate deterministic official dev inputs
+        run: |
+          mkdir -p /tmp/shop-dev /tmp/shop-scratch /tmp/shop-out
+          tools/official-generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/shop-dev
+      - name: Compile engine and install DuckDB
+        run: |
+          g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -o shopping-core main.cpp
+          python3 -m pip install duckdb==1.4.1
+      - name: Run complete CSV-to-Parquet pipeline
+        env:
+          DATA_DIR: /tmp/shop-dev
+          OUTPUT_DIR: /tmp/shop-out
+          SCRATCH_DIR: /tmp/shop-scratch
+          NCPU: "8"
+        run: |
+          /usr/bin/time -v ./shopping-core
+          /usr/bin/time -v python3 write_parquet.py
+          python3 scripts/check_official_dev.py
