@@ -50,7 +50,7 @@ class Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not BIN.exists():
-            subprocess.run(['g++','-std=c++20','-O2','-o',str(BIN),str(ROOT/'main.cpp')],check=True)
+            subprocess.run(['g++','-std=c++20','-O2','-fopenmp','-o',str(BIN),str(ROOT/'main.cpp')],check=True)
 
     def test_sessions_attribution_assists_and_bad_duplicates(self):
         with tempfile.TemporaryDirectory() as tmp:
