@@ -193,6 +193,34 @@ struct DenseSet {
  void place(string_view id,uint64_t h){size_t mask=slots.size()-1,j=h&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]={id,h};++count;}
  void clear(){vector<Entry> t;t.swap(slots);count=0;}
 };
+// Worker-private compact cache for repeated user IDs. All keys point into held event mmaps.
+struct DenseUserCache{
+ struct Slot{string_view id{};uint32_t root=0;uint32_t fingerprint=0;};
+ static_assert(sizeof(Slot)==24);
+ vector<Slot> slots;size_t used=0;
+ void reserve(size_t n){size_t c=1;while(c<n*1.42+8)c*=2;slots.resize(c);}
+ void grow(){
+  auto old=std::move(slots);
+  slots.resize(old.size()?old.size()*2:1024);
+  size_t mask=slots.size()-1;
+  for(auto const&e:old)if(e.fingerprint){
+   auto h=DenseEvents::hkey(e.id);size_t j=h&mask;
+   while(slots[j].fingerprint)j=(j+1)&mask;
+   slots[j]=e;
+  }
+ }
+ template<class Resolver> uint32_t get(string_view id,Resolver&& resolver){
+  if((used+1)*10>slots.size()*7)grow();
+  uint64_t h=DenseEvents::hkey(id);uint32_t fp=(uint32_t)h|1u;
+  size_t mask=slots.size()-1,j=h&mask;
+  while(slots[j].fingerprint){
+   auto& e=slots[j];if(e.fingerprint==fp&&e.id==id)return e.root;
+   j=(j+1)&mask;
+  }
+  uint32_t root=resolver();
+  slots[j]={id,root,fp};++used;return root;
+ }
+};
 struct Event{int64_t ts;uint32_t user;int32_t price;uint16_t cat;bool purchase;};
 struct Click{int64_t ts;uint32_t user;uint16_t campaign;string_view id;};
 struct Camp{string id,channel;};
@@ -256,7 +284,7 @@ static void run(const fs::path& data,const fs::path& scratch){
  atomic<size_t> next(0);
  unsigned nw=4; if(const char* env=getenv("NCPU")){int value=atoi(env);if(value>0)nw=std::min(nw,(unsigned)std::clamp(value,1,8));} if(const char* env=getenv("SHOP_WORKERS")){int value=atoi(env);if(value>0)nw=std::min(nw,(unsigned)std::clamp(value,1,8));}
  auto worker=[&](unsigned){
-  unordered_map<string_view,uint32_t,TransparentHash,equal_to<>> userCache;
+  DenseUserCache userCache;
   userCache.reserve(1<<16);
   struct Pending {string_view id;uint64_t h;EventRecord rec;};
   array<vector<Pending>,SHARDS> pending;
@@ -295,14 +323,11 @@ static void run(const fs::path& data,const fs::path& scratch){
       int32_t price=0;bool purchase=f[4]=="purchase";
       if(!purchase||price_value(f[6],price)){
         rec.valid=true;rec.ts=ts;rec.price=price;rec.purchase=purchase;
-        auto u=userCache.find(f[1]);
-        if(u!=userCache.end())rec.user=u->second;
-        else{
-         auto lk=linkedRoots.find(f[1]);
-         if(lk!=linkedRoots.end())rec.user=lk->second;
-         else {lock_guard<mutex> guard(graphLock);rec.user=graph.intern(f[1]);}
-         userCache.emplace(f[1],rec.user);
-        }
+        rec.user=userCache.get(f[1],[&](){
+          auto lk=linkedRoots.find(f[1]);
+          if(lk!=linkedRoots.end())return lk->second;
+          lock_guard<mutex> guard(graphLock);return graph.intern(f[1]);
+        });
         if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
       }
     }
