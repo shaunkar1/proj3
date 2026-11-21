@@ -149,7 +149,7 @@ struct IdGraph{
 };
 struct EventRecord{int64_t ingest=0,ts=0;uint32_t user=0;int32_t price=0;uint16_t cat=0;bool purchase=false,valid=false;};
 struct DenseEvents {
- struct Entry {string_view id{};EventRecord rec{};bool assigned=false;};
+ struct Entry {EventRecord rec{};const char* ptr=nullptr;uint32_t len=0;bool assigned=false;};
  struct Slot {uint32_t hash=0;uint32_t index=0;};
  vector<Slot> slots;
  vector<Entry> entries;
@@ -168,8 +168,8 @@ struct DenseEvents {
    size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=e.hash&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
   size_t mask=slots.size()-1,j=h&mask;
   for(;;){auto& e=slots[j];
-   if(!e.hash){e.hash=(uint32_t)h|1u;e.index=entries.size();entries.emplace_back();entries.back().id=id;return &entries.back();}
-   if(e.hash==((uint32_t)h|1u) && entries[e.index].id==id)return &entries[e.index];
+   if(!e.hash){e.hash=(uint32_t)h|1u;e.index=entries.size();entries.emplace_back();entries.back().ptr=id.data();entries.back().len=(uint32_t)id.size();return &entries.back();}
+   if(e.hash==((uint32_t)h|1u) && entries[e.index].len==id.size()&&memcmp(entries[e.index].ptr,id.data(),id.size())==0)return &entries[e.index];
    j=(j+1)&mask;
   }
  }
