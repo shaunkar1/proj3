@@ -289,7 +289,7 @@ static void run(const fs::path& data,const fs::path& scratch){
   struct Pending {string_view id;uint64_t h;EventRecord rec;};
   array<vector<Pending>,SHARDS> pending;
   for(auto &v:pending)v.reserve(32);
-  unsigned batchLimit=512; if(const char *e=getenv("SHOP_BATCH")){int v=atoi(e);if(v>=32&&v<=8192)batchLimit=v;}
+  unsigned batchLimit=1024; if(const char *e=getenv("SHOP_BATCH")){int v=atoi(e);if(v>=32&&v<=8192)batchLimit=v;}
   size_t buffered=0;
   auto flush=[&](){
    for(unsigned ix=0;ix<SHARDS;ix++){
