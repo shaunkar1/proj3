@@ -1,9 +1,11 @@
 // Shopping Sessions: exact CSV / identity / attribution core.
 // No third-party C++ libraries, intermediate output is hex-encoded to preserve raw identifiers.
 #include <algorithm>
+#include <parallel/algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -18,6 +20,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 using namespace std;
 namespace fs=std::filesystem;
 static constexpr int64_t DAY=86400000LL, WEEK=7*DAY, GAP=1800000LL;
@@ -75,10 +81,27 @@ static vector<fs::path> csv_files(const fs::path& dir){
  for(auto& f:fs::directory_iterator(dir))if(f.is_regular_file()&&f.path().extension()==".csv")out.push_back(f.path());
  sort(out.begin(),out.end());return out;
 }
-template<class FN> static void read_lines(const fs::path& path,FN&& fn){
- ifstream in(path,ios::binary);if(!in)throw runtime_error("Cannot open "+path.string());
- string line;getline(in,line); // header
- while(getline(in,line))fn(string_view(line));
+static vector<pair<void*,size_t>> held_mmaps;
+static void release_mmaps(){for(auto [p,n]:held_mmaps)munmap(p,n);held_mmaps.clear();}
+template<class FN> static void read_lines(const fs::path& path,FN&& fn,bool hold=false){
+ int fd=open(path.c_str(),O_RDONLY);
+ if(fd<0)throw runtime_error("Cannot open "+path.string());
+ struct stat st{};if(fstat(fd,&st)!=0){close(fd);throw runtime_error("Cannot stat "+path.string());}
+ size_t len=st.st_size;
+ if(len==0){close(fd);return;}
+ void* base=mmap(nullptr,len,PROT_READ,MAP_PRIVATE,fd,0);
+ close(fd);
+ if(base==MAP_FAILED)throw runtime_error("Cannot map "+path.string());
+ const char* p=(const char*)base,*end=p+len;
+ const char* nl=(const char*)memchr(p,'\n',end-p);
+ if(!nl){if(hold)held_mmaps.push_back({base,len});else munmap(base,len);return;}
+ p=nl+1;
+ while(p<end){const char* begin=p;
+  nl=(const char*)memchr(p,'\n',end-p);
+  if(nl){fn(string_view(begin,(size_t)(nl-begin)));p=nl+1;}
+  else{fn(string_view(begin,(size_t)(end-begin)));break;}
+ }
+ if(hold)held_mmaps.push_back({base,len});else munmap(base,len);
 }
 static string read_all(const fs::path& path){ifstream in(path,ios::binary);if(!in)throw runtime_error("Cannot open "+path.string());return string(istreambuf_iterator<char>(in),{});}
 static string json_string(const string& s,const string& key){
@@ -88,11 +111,17 @@ static string json_string(const string& s,const string& key){
  auto e=s.find('"',p+1);if(e==string::npos)throw runtime_error("manifest error");return s.substr(p+1,e-p-1);
 }
 static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF";string r; r.resize(s.size()*2);for(size_t i=0;i<s.size();i++){unsigned char b=s[i];r[2*i]=h[b>>4];r[2*i+1]=h[b&15];}return r;}
+struct TransparentHash {
+ using is_transparent=void;
+ size_t operator()(string_view x)const noexcept {return hash<string_view>{}(x);}
+};
+template <class V> using FastMap=unordered_map<string,V,TransparentHash,equal_to<>>;
+using FastSet=unordered_set<string,TransparentHash,equal_to<>>;
 struct IdGraph{
- unordered_map<string,uint32_t> keys;
+ FastMap<uint32_t> keys;
  vector<uint32_t> parent,sz;
  vector<string> names;
- uint32_t intern(string_view s){auto it=keys.find(string(s));if(it!=keys.end())return it->second;
+ uint32_t intern(string_view s){auto it=keys.find(s);if(it!=keys.end())return it->second;
   uint32_t n=parent.size(); keys.emplace(string(s),n);parent.push_back(n);sz.push_back(1);names.emplace_back(s);return n;
  }
  uint32_t find(uint32_t x){uint32_t y=x;while(parent[y]!=y)y=parent[y];while(parent[x]!=x){auto z=parent[x];parent[x]=y;x=z;}return y;}
@@ -101,6 +130,34 @@ struct IdGraph{
  }
 };
 struct EventRecord{int64_t ingest=0,ts=0;uint32_t user=0;int32_t price=0;uint16_t cat=0;bool purchase=false,valid=false;};
+struct DenseEvents {
+ struct Entry {string_view id{}; EventRecord rec{};uint64_t hash=0;};
+ vector<Entry> slots;size_t count=0;
+ void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);}
+ static uint64_t hkey(string_view s){uint64_t h=hash<string_view>{}(s);return h?h:1;}
+ Entry* slot(string_view id,uint64_t h){
+  if((count+1)*10>slots.size()*8){vector<Entry> old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);count=0;
+   size_t mask=slots.size()-1;for(const auto& e:old)if(e.hash){size_t j=e.hash&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;++count;}
+  }
+  size_t mask=slots.size()-1,j=h&mask;
+  for(;;){auto& e=slots[j];if(!e.hash||e.hash==h&&e.id==id)return &e;j=(j+1)&mask;}
+ }
+ size_t size() const{return count;}
+ void clear(){vector<Entry> t;t.swap(slots);count=0;}
+};
+struct DenseSet {
+ struct Entry {string_view id{};uint64_t hash=0;};
+ vector<Entry> slots;size_t count=0;
+ void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);}
+ bool insert(string_view id){
+  uint64_t h=DenseEvents::hkey(id);size_t mask=slots.size()-1,j=h&mask;
+  while(slots[j].hash){auto &e=slots[j];if(e.hash==h&&e.id==id)return false;j=(j+1)&mask;}
+  if((count+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);count=0;for(const auto&e:old)if(e.hash)place(e.id,e.hash);mask=slots.size()-1;j=h&mask;while(slots[j].hash)j=(j+1)&mask;}
+  slots[j]={id,h};++count;return true;
+ }
+ void place(string_view id,uint64_t h){size_t mask=slots.size()-1,j=h&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]={id,h};++count;}
+ void clear(){vector<Entry> t;t.swap(slots);count=0;}
+};
 struct Event{int64_t ts;uint32_t user;int32_t price;uint16_t cat;bool purchase;};
 struct Click{int64_t ts;uint32_t user;uint16_t campaign;string id;};
 struct Camp{string id,channel;};
@@ -108,36 +165,38 @@ struct Totals{uint64_t sessions=0,purchasing_sessions=0,revenue=0,assists=0;};
 struct UserTotals{uint64_t sessions=0,events=0,revenue=0;};
 static int64_t divfloor(int64_t a,int64_t b){int64_t q=a/b;return q-((a%b)<0);}
 static bool price_value(string_view s,int32_t& val){if(!ascii_digits(s))return false;uint64_t p=0;for(char c:s){p=p*10+(c-'0');if(p>10000000)return false;}if(!p)return false;val=p;return true;}
-static uint16_t cat_id(string_view cat,unordered_map<string,uint16_t>& ids,vector<string>& names){
- auto it=ids.find(string(cat));if(it!=ids.end())return it->second;
+static uint16_t cat_id(string_view cat,FastMap<uint16_t>& ids,vector<string>& names){
+ auto it=ids.find(cat);if(it!=ids.end())return it->second;
  if(names.size()>=65535)throw runtime_error("Too many categories");
  uint16_t n=names.size();names.emplace_back(cat);ids.emplace(names.back(),n);return n;
 }
 static void run(const fs::path& data,const fs::path& scratch){
+ auto __time0=chrono::steady_clock::now();
+ auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;};
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
  IdGraph graph;
  for(const auto& p:csv_files(data/"links"))read_lines(p,[&](string_view line){string_view f[2];if(fields(line,2,f)&&!f[0].empty()&&!f[1].empty())graph.link(f[0],f[1]);});
- cerr<<"linked IDs: "<<graph.parent.size()<<"\n";
- unordered_map<string,uint16_t> categories;vector<string> catnames;
+ __mark("LINKS"); cerr<<"linked IDs: "<<graph.parent.size()<<"\n";
+ FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
- unordered_map<string,uint16_t> products;
+ FastMap<uint16_t> products;
  read_lines(data/"products.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean products.csv");products.emplace(string(f[0]),cat_id(f[1],categories,catnames));});
- vector<Camp> campaigns;unordered_map<string,uint16_t> camps;
+ vector<Camp> campaigns;FastMap<uint16_t> camps;
  read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");camps.emplace(string(f[0]),(uint16_t)campaigns.size());campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  // Earliest parseable duplicate, including one that later fails validation.
- unordered_map<string,EventRecord> eventmap;
+ DenseEvents eventmap;
  const auto eventFiles=csv_files(data/"events");
  uint64_t eventBytes=0;for(const auto& p:eventFiles)eventBytes+=fs::file_size(p);
  eventmap.reserve((size_t)(eventBytes/65+1));
  for(const auto& p:eventFiles)read_lines(p,[&](string_view line){
   string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
   int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
-  string key(f[0]);auto it=eventmap.find(key);
-  if(it!=eventmap.end()&&it->second.ingest<=ingest)return;
+  auto key=f[0];auto h=DenseEvents::hkey(key);auto it=eventmap.slot(key,h);
+  if(it->hash&&it->rec.ingest<=ingest)return;
   EventRecord rec;rec.ingest=ingest;
   int64_t ts;
   if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
@@ -145,38 +204,38 @@ static void run(const fs::path& data,const fs::path& scratch){
     int32_t price=0;bool purchase=f[4]=="purchase";
     if(!purchase||price_value(f[6],price)){
       rec.valid=true;rec.ts=ts;rec.user=graph.intern(f[1]);rec.price=price;rec.purchase=purchase;
-      if(purchase){auto prod=products.find(string(f[5]));rec.cat=prod==products.end()?0:prod->second;}
+      if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
     }
   }
-  if(it==eventmap.end())eventmap.emplace(std::move(key),rec);else it->second=rec;
- });
- vector<Event> events;events.reserve(eventmap.size());
- for(const auto& [id,e]:eventmap)if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});
+  if(!it->hash){it->id=key;it->hash=h;++eventmap.count;}it->rec=rec;
+ },true);
+__mark("EVENT_READ"); vector<Event> events;events.reserve(eventmap.size());
+ for(const auto& entry:eventmap.slots)if(entry.hash){const auto& e=entry.rec;if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});}
  cerr<<"deduplicated events: "<<eventmap.size()<<", surviving: "<<events.size()<<"\n";
- {decltype(eventmap) empty;eventmap.swap(empty);}
- // A click's duplicates are identical; the first parseable occurrence is enough.
- vector<Click> clicks;unordered_set<string> seen;
+ eventmap.clear();release_mmaps();
+__mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
+ vector<Click> clicks;DenseSet seen;
  const auto clickFiles=csv_files(data/"clicks");
  uint64_t clickBytes=0;for(const auto& p:clickFiles)clickBytes+=fs::file_size(p);
  seen.reserve((size_t)(clickBytes/55+1));
  for(const auto& p:clickFiles)read_lines(p,[&](string_view line){
   string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
-  string key(f[0]);if(!seen.insert(key).second)return;
-  int64_t ts=0;auto ci=camps.find(string(f[2]));
+  auto key=f[0];if(!seen.insert(key))return;
+  int64_t ts=0;auto ci=camps.find(f[2]);
   if(f[1].empty()||ci==camps.end()||!parse_ts(f[3],ts)||ts<window_start-WEEK||ts>=window_end)return;
-  clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,std::move(key)});
- });
+  clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,string(key)});
+ },true);
  cerr<<"surviving clicks: "<<clicks.size()<<"\n";
- {decltype(seen) empty;seen.swap(empty);}
+ seen.clear();release_mmaps();
  {decltype(products) empty;products.swap(empty);} {decltype(categories) empty;categories.swap(empty);}
  {decltype(graph.keys) empty;graph.keys.swap(empty);}
- // graph must stay alive for canonical names; no new users are interned after this point.
- sort(events.begin(),events.end(),[](const Event& a,const Event& b){if(a.user!=b.user)return a.user<b.user;return a.ts<b.ts;});
- sort(clicks.begin(),clicks.end(),[](const Click& a,const Click& b){
+__mark("CLICK_READ"); // graph must stay alive for canonical names; no new users are interned after this point.
+ __gnu_parallel::sort(events.begin(),events.end(),[](const Event& a,const Event& b){if(a.user!=b.user)return a.user<b.user;return a.ts<b.ts;});
+ __gnu_parallel::sort(clicks.begin(),clicks.end(),[](const Click& a,const Click& b){
   if(a.user!=b.user)return a.user<b.user;if(a.ts!=b.ts)return a.ts<b.ts;
   return a.id>b.id; // last click at equal timestamp has lexicographically smallest ID
  });
- fs::create_directories(scratch);
+__mark("SORT"); fs::create_directories(scratch);
  ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc);
  ofstream cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);
  if(!uout||!cout)throw runtime_error("Cannot open scratch files");
@@ -230,14 +289,14 @@ static void run(const fs::path& data,const fs::path& scratch){
   for(uint16_t ci:active)freq[ci]=0;
   active.clear();ei=end;
  }
- for(size_t ci=0;ci<campaigns.size();++ci){
+__mark("AGGREGATE"); for(size_t ci=0;ci<campaigns.size();++ci){
   for(int d=0;d<nday;++d){auto& t=campTotals[ci*(size_t)nday+d];if(t.sessions==0&&t.assists==0)continue;
    cout<<hexstr(campaigns[ci].id)<<','<<hexstr(campaigns[ci].channel)<<','<<(firstday+d)<<','<<t.sessions<<','<<t.purchasing_sessions<<','<<t.revenue<<','<<t.assists<<'\n';
   }
  }
  uout.close();cout.close();
  if(!uout||!cout)throw runtime_error("Failed writing intermediate CSV");
- cerr<<"completed sessions: "<<num_sessions<<"\n";
+__mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
 }
 int main(){try{
  const char* d=getenv("DATA_DIR");const char* s=getenv("SCRATCH_DIR");
