@@ -41,6 +41,7 @@ static int64_t days_from_civil(int y,unsigned m,unsigned d){
 static bool parse_ts(string_view s,int64_t& out){
  if(ascii_digits(s)){
    uint64_t x=0;
+   if(s.size()<=18){for(unsigned char c:s) x=x*10+(c-'0');out=(int64_t)x;return true;}
    for(unsigned char c:s){unsigned k=c-'0';if(x>(uint64_t(INT64_MAX)-k)/10)return false;x=x*10+k;}
    out=(int64_t)x;return true;
  }
@@ -62,18 +63,19 @@ static bool parse_ts(string_view s,int64_t& out){
 // We explicitly preserve CR as data and never trim whitespace.
 static bool fields(string_view line,int n,string_view* out){
  if(line.empty())return false;
- int j=0;size_t st=0;
- for(size_t i=0;i<=line.size();++i){
-  if(i<line.size()&&line[i]!=',')continue;
-  if(j>=n)return false;
-  auto f=line.substr(st,i-st);
-  if(f.size()>=2&&f.front()=='"'&&f.back()=='"'){
-   f.remove_prefix(1);f.remove_suffix(1);
-   if(f.find('"')!=string_view::npos)return false;
-  }else if(f.find('"')!=string_view::npos)return false;
-  out[j++]=f;st=i+1;
+ const char *p=line.data(),*end=p+line.size();
+ for(int j=0;j<n;j++){
+   const char *q=(j==n-1)?end:(const char*)memchr(p,',',end-p);
+   if(!q)return false;
+   string_view f(p,q-p);
+   if(f.size()>=2&&f.front()=='"'&&f.back()=='"'){
+     f.remove_prefix(1);f.remove_suffix(1);
+     if(f.find('"')!=string_view::npos)return false;
+   }else if(f.find('"')!=string_view::npos)return false;
+   if(j==n-1&&memchr(p,',',end-p))return false;
+   out[j]=f;p=q+1;
  }
- return j==n;
+ return p==end+1;
 }
 static vector<fs::path> csv_files(const fs::path& dir){
  vector<fs::path> out;
@@ -131,19 +133,32 @@ struct IdGraph{
 };
 struct EventRecord{int64_t ingest=0,ts=0;uint32_t user=0;int32_t price=0;uint16_t cat=0;bool purchase=false,valid=false;};
 struct DenseEvents {
- struct Entry {string_view id{}; EventRecord rec{};uint64_t hash=0;};
- vector<Entry> slots;size_t count=0;
- void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);}
- static uint64_t hkey(string_view s){uint64_t h=hash<string_view>{}(s);return h?h:1;}
- Entry* slot(string_view id,uint64_t h){
-  if((count+1)*10>slots.size()*8){vector<Entry> old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);count=0;
-   size_t mask=slots.size()-1;for(const auto& e:old)if(e.hash){size_t j=e.hash&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;++count;}
-  }
-  size_t mask=slots.size()-1,j=h&mask;
-  for(;;){auto& e=slots[j];if(!e.hash||e.hash==h&&e.id==id)return &e;j=(j+1)&mask;}
+ struct Entry {string_view id{};EventRecord rec{};bool assigned=false;};
+ struct Slot {uint32_t hash=0;uint32_t index=0;};
+ vector<Slot> slots;
+ vector<Entry> entries;
+ void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);entries.reserve((size_t)(n*1.75));}
+ static uint64_t mix(uint64_t x){x^=x>>32;x*=0xd6e8feb86659fd93ULL;x^=x>>32;x*=0xd6e8feb86659fd93ULL;return x^(x>>32);}
+ static uint64_t hkey(string_view s){
+   const unsigned char* p=(const unsigned char*)s.data();size_t n=s.size();
+   uint64_t h=0x9e3779b97f4a7c15ULL ^ (n*0xbf58476d1ce4e5b9ULL);
+   while(n>=8){uint64_t w;memcpy(&w,p,8);h=mix(h^w);p+=8;n-=8;}
+   uint64_t tail=0;memcpy(&tail,p,n);h=mix(h^tail);
+   return h?h:1;
  }
- size_t size() const{return count;}
- void clear(){vector<Entry> t;t.swap(slots);count=0;}
+ Entry* slot(string_view id,uint64_t h){
+  h |= 1ULL; // exact same home bucket before/after rehash; 0 denotes empty
+  if((entries.size()+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);
+   size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=e.hash&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
+  size_t mask=slots.size()-1,j=h&mask;
+  for(;;){auto& e=slots[j];
+   if(!e.hash){e.hash=(uint32_t)h|1u;e.index=entries.size();entries.emplace_back();entries.back().id=id;return &entries.back();}
+   if(e.hash==((uint32_t)h|1u) && entries[e.index].id==id)return &entries[e.index];
+   j=(j+1)&mask;
+  }
+ }
+ size_t size() const{return entries.size();}
+ void clear(){vector<Slot>().swap(slots);vector<Entry>().swap(entries);}
 };
 struct DenseSet {
  struct Entry {string_view id{};uint64_t hash=0;};
@@ -196,7 +211,7 @@ static void run(const fs::path& data,const fs::path& scratch){
   string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
   int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
   auto key=f[0];auto h=DenseEvents::hkey(key);auto it=eventmap.slot(key,h);
-  if(it->hash&&it->rec.ingest<=ingest)return;
+  if(it->assigned && it->rec.ingest<=ingest)return;
   EventRecord rec;rec.ingest=ingest;
   int64_t ts;
   if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
@@ -207,10 +222,10 @@ static void run(const fs::path& data,const fs::path& scratch){
       if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
     }
   }
-  if(!it->hash){it->id=key;it->hash=h;++eventmap.count;}it->rec=rec;
+  it->rec=rec;it->assigned=true;
  },true);
 __mark("EVENT_READ"); vector<Event> events;events.reserve(eventmap.size());
- for(const auto& entry:eventmap.slots)if(entry.hash){const auto& e=entry.rec;if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});}
+ for(const auto& entry:eventmap.entries){const auto& e=entry.rec;if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});}
  cerr<<"deduplicated events: "<<eventmap.size()<<", surviving: "<<events.size()<<"\n";
  eventmap.clear();release_mmaps();
 __mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
